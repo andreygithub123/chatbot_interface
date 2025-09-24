@@ -42,7 +42,7 @@ class GenericCompanyDetailsState(TypedDict):
     uploaded_excel: Optional[bool]
     excel_file_path: Optional[str]
     qa_dict: Optional[Dict[str,str]]
-    last_human_answer: Optional[str]
+    #last_human_answer: Optional[str]
     remaining_steps: Optional[int]
     done: NotRequired[bool]
 
@@ -89,12 +89,42 @@ def format_data_from_xlsx(file_path,sheet_name):
 
 
 # helper ToolMessage function
+from langchain_core.messages import BaseMessage
+
+def _json_safe(obj):
+    """Recursively coerce LangChain messages and other non-serializable
+    objects into JSON-serializable structures."""
+    # primitives
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    # dicts
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    # lists/tuples
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(x) for x in obj]
+    # LangChain messages
+    if isinstance(obj, BaseMessage):
+        # BaseMessage has .type (e.g. "human"/"ai"/"tool") and .content
+        return {
+            "message_type": obj.__class__.__name__,
+            "role": getattr(obj, "type", None),
+            "name": getattr(obj, "name", None),
+            "tool_call_id": getattr(obj, "tool_call_id", None),
+            "content": obj.content,
+        }
+    # anything else -> string fallback
+    try:
+        json.dumps(obj)  # will succeed for many simple types
+        return obj
+    except TypeError:
+        return str(obj)
+
 def _pack(payload):
-        return json.dumps(payload,ensure_ascii=False,indent=2)
+    return json.dumps(_json_safe(payload), ensure_ascii=False, indent=2)
     
 
 # tools 
-
 @tool
 def list_sheets(
     file_path: Annotated[Optional[str],InjectedState("excel_file_path")] = None,
@@ -229,7 +259,7 @@ def associate_fields(
 def show_fields(
     current_fields: Annotated[GenericCompanyDetailsFields,InjectedState("fields")],
     tool_call_id: Annotated[Optional[str],InjectedToolCallId]="",
-)-> str:
+)-> Command:
     """Return the current fields as JSON so the agent can talk about them."""
 
     msg = ToolMessage(
@@ -238,6 +268,50 @@ def show_fields(
         name="show_fields"
     )
     return Command(update={"messages":[msg]})
+
+@tool
+def show_state(
+    state: Annotated[GenericCompanyDetailsState,InjectedState],
+    tool_call_id: Annotated[Optional[str],InjectedToolCallId]="",
+)-> Command:
+    """ Return the  state at any point in time if asked to. Can be used as a progress feedback. """
+    fields_dict = state.get("fields") or {}
+    all_field_keys = list(GenericCompanyDetailsFields.__annotations__.keys())
+    total_fields = len(all_field_keys)
+    filled_fields = sum(1 for k in all_field_keys if str(fields_dict.get(k, "")).strip())
+    percent = round((filled_fields / total_fields) * 100, 1) if total_fields else 0.0
+
+    # Trim messages for readability (last 5 only), and make them JSON-safe
+    msgs = state.get("messages") or []
+    recent_msgs = msgs[-5:] if len(msgs) > 5 else msgs
+    recent_msgs_safe = [_json_safe(m) for m in recent_msgs]
+
+    snapshot = {
+        "status": "ok",
+        "progress": {
+            "uploaded_excel": bool(state.get("uploaded_excel")),
+            "excel_file_path": state.get("excel_file_path"),
+            "fields_total": total_fields,
+            "fields_filled": filled_fields,
+            "percent_complete": percent,
+            "remaining_steps": state.get("remaining_steps"),
+            "done": state.get("done", False),
+        },
+        "state": {
+            # include everything except the full messages list
+            **{k: v for k, v in state.items() if k != "messages"},
+            # add a compact, readable version of recent messages
+            "messages_tail": recent_msgs_safe,
+            "message_count": len(msgs),
+        },
+    }
+
+    msg = ToolMessage(
+        content=_pack(snapshot),
+        tool_call_id=tool_call_id,
+        name="show_state",
+    )
+    return Command(update={"messages": [msg]})
 
 
 @tool
@@ -254,7 +328,7 @@ def end_conversation(tool_call_id: Annotated[str, InjectedToolCallId])->Command:
         msg = ToolMessage(
             content=_pack({"status": "error", "error": f"{e.__class__.__name__}: {e}"}),
             tool_call_id=tool_call_id,
-            name="list_sheets",
+            name="end_conversation",
         )
         return Command(update={"messages": [msg]})
 
@@ -309,6 +383,7 @@ REACT_AGENT_PROMPT = (
     "- Then call extract_fields(sheet_name=...) to load Q→A into state.last_qa.\n"
     "- Next, call associate_fields() to map Q→A to canonical field keys.\n"
     "- Use show_fields() to review current fields and answer questions.\n"
+    "- Use show_state() to get the current state and answer questions. Good for when the user wants to know progress. Use the retrieved state fields to generate a human-readable response, not give directly the state attribute as it is. For example : if a state attribute 'favourite_food' = None, after you retrieve the state your response should be something like 'You did not specified yet your favourite food.\n"
     "- Use end_conversation() when the user wants to finish the conversation or after you have the user's approval that field extraction was successfully completed."
     "Keep answers concise unless the human asks for detail."
 )
@@ -316,7 +391,7 @@ REACT_AGENT_PROMPT = (
 # NOTE: might be a better idea to switch to own iplementation of ReAct agent
 react_agent = create_react_agent(
     model = llm,
-    tools=[list_sheets, extract_fields, associate_fields, show_fields,end_conversation],
+    tools=[list_sheets, extract_fields, associate_fields, show_fields,end_conversation,show_state],
     prompt = REACT_AGENT_PROMPT,
     state_schema= GenericCompanyDetailsState
 )
