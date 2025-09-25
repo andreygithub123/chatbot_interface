@@ -10,9 +10,16 @@ from langgraph.graph import  StateGraph,START,END
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.tools import tool,InjectedToolCallId
 from pathlib import Path
+from langgraph.checkpoint.postgres import PostgresSaver
 import pandas as pd
 import json
+import os
+import threading
+from dotenv import load_dotenv
 
+load_dotenv()
+
+# --- Model Config ----
 FILE_PATH = "src/data/HidroPrahova - Inventar_Generalist_Organizatie.xlsx"
 #MODEL_NAME = "PetrosStav/gemma3-tools:12b"
 MODEL_NAME="gpt-oss:20b"
@@ -313,6 +320,58 @@ def show_state(
     )
     return Command(update={"messages": [msg]})
 
+@tool
+def change_state_fields(
+    field_name: str,
+    field_value: str,
+    state_fields: Annotated[GenericCompanyDetailsFields,InjectedState("fields")],
+    tool_call_id: Annotated[str,InjectedToolCallId]
+) -> Command:
+    """
+    Tool used for updating specific fields in the company details state.
+
+    Args:
+        field_name: The name of the field to update (e.g., 'has_multiple_legal_entitites')
+        field_value: The new value for the field
+        state_fields: Current state fields (injected)
+        tool_call_id: Tool call ID (injected)
+    """
+    try:
+        # Get valid field names from the TypedDict
+        valid_fields = list(GenericCompanyDetailsFields.__annotations__.keys())
+
+        if field_name not in valid_fields:
+            available_fields = ", ".join(valid_fields)
+            msg = ToolMessage(
+                content=f"Error: '{field_name}' is not a valid field name. Available fields: {available_fields}",
+                tool_call_id=tool_call_id,
+                name="change_state_fields"
+            )
+            return Command(update={"messages": [msg]})
+
+        # state_fields is an immutable reference to the current state in LangGraph -> copy needed
+        current_fields = state_fields or {}
+        updated_fields = current_fields.copy()
+        updated_fields[field_name] = field_value
+
+        msg = ToolMessage(
+            content=f"Successfully updated field '{field_name}' to: '{field_value}'",
+            tool_call_id=tool_call_id,
+            name="change_state_fields"
+        )
+
+        return Command(update={
+            "fields": updated_fields,
+            "messages": [msg]
+        })
+
+    except Exception as e:
+        msg = ToolMessage(
+            content=f"Error updating field: {e.__class__.__name__}: {e}",
+            tool_call_id=tool_call_id,
+            name="change_state_fields"
+        )
+        return Command(update={"messages": [msg]})
 
 @tool
 def end_conversation(tool_call_id: Annotated[str, InjectedToolCallId])->Command:
@@ -384,14 +443,14 @@ REACT_AGENT_PROMPT = (
     "- Next, call associate_fields() to map Q→A to canonical field keys.\n"
     "- Use show_fields() to review current fields and answer questions.\n"
     "- Use show_state() to get the current state and answer questions. Good for when the user wants to know progress. Use the retrieved state fields to generate a human-readable response, not give directly the state attribute as it is. For example : if a state attribute 'favourite_food' = None, after you retrieve the state your response should be something like 'You did not specified yet your favourite food.\n"
+    "- Use change_state_fields(field_name=...,field_value=...) in order to update a field state attribute on user request. This function takes two parameters and is your job to identify them based on your conversation with the user."
     "- Use end_conversation() when the user wants to finish the conversation or after you have the user's approval that field extraction was successfully completed."
     "Keep answers concise unless the human asks for detail."
 )
 
-# NOTE: might be a better idea to switch to own iplementation of ReAct agent
 react_agent = create_react_agent(
     model = llm,
-    tools=[list_sheets, extract_fields, associate_fields, show_fields,end_conversation,show_state],
+    tools=[list_sheets, extract_fields, associate_fields, show_fields, change_state_fields, end_conversation, show_state],
     prompt = REACT_AGENT_PROMPT,
     state_schema= GenericCompanyDetailsState
 )
@@ -412,25 +471,67 @@ def route_after_agent(state: GenericCompanyDetailsState):
     return "human" if not state.get("done") else END
 
 # build and compile graph
-builder = StateGraph(GenericCompanyDetailsState)
-builder.add_node("human",human_node)
-builder.add_node("agent",react_agent)
-builder.add_node("init_node",init_node)
+# --- commented for implementing thread-safe module persistency with PostgreSQL ---
+# builder = StateGraph(GenericCompanyDetailsState)
+# builder.add_node("human",human_node)
+# builder.add_node("agent",react_agent)
+# builder.add_node("init_node",init_node)
 
-builder.add_edge(START,"init_node")
-builder.add_edge("init_node","human")
-builder.add_edge("human","agent")
-builder.add_conditional_edges(
-    "agent",
-    route_after_agent,
-    {
-        "human":"human",
-        END:END
-    }
-)
+# builder.add_edge(START,"init_node")
+# builder.add_edge("init_node","human")
+# builder.add_edge("human","agent")
+# builder.add_conditional_edges(
+#     "agent",
+#     route_after_agent,
+#     {
+#         "human":"human",
+#         END:END
+#     }
+# )
 
-memory = MemorySaver()
-app = builder.compile(checkpointer=memory)
+# memory = MemorySaver()
+# app = builder.compile(checkpointer=memory)
+# ---------------------------------------------------------------------------------------
+
+def _compile_root():
+    builder = StateGraph(GenericCompanyDetailsState)
+    builder.add_node("human", human_node)
+    builder.add_node("agent", react_agent)
+    builder.add_node("init_node", init_node)
+
+    builder.add_edge(START, "init_node")
+    builder.add_edge("init_node", "human")
+    builder.add_edge("human", "agent")
+    builder.add_conditional_edges(
+        "agent",
+        route_after_agent,
+        {"human": "human", END: END},
+    )
+    return builder.compile(checkpointer=_SAVER)
+
+# --- Thread-Safe Module Singleton ---
+_DB_URI = os.environ.get("DB_URI")
+
+
+# --- some bullshit I don't understand ---
+import atexit
+_saver_cm = PostgresSaver.from_conn_string(_DB_URI)
+_SAVER = _saver_cm.__enter__()    # open once
+_SAVER.setup()
+atexit.register(_saver_cm.__exit__, None, None, None)  # close on exit
+
+_APP = None
+_LOCK = threading.RLock()
+
+def get_app():
+    """Return the singleton compiled app (persisted with Postgres)."""
+    global _APP
+    if _APP is None:
+        with _LOCK:
+            if _APP is None:  # double-checked locking
+                _APP = _compile_root()
+    return _APP
+# -------------------------------------------------------------------------------------------------
 
 def _handoff_node_factory(
         parent_target: Optional[str],

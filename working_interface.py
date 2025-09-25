@@ -9,7 +9,7 @@ from pathlib import Path
 from datetime import datetime
 
 from gradio import ChatMessage
-from react_general_workflow import app
+from react_general_workflow import get_app
 from langgraph.types import Command
 from langchain_core.messages import AIMessage, ToolMessage, BaseMessage
 
@@ -304,7 +304,7 @@ def run_langgraph_turn(history,sessions,session_id):
     if not session_id:
         session_id = "default"
     sess = _ensure_session(sessions,session_id)
-
+    app = get_app() # imported singleton graph with persistency
     config = {"configurable":{"thread_id":sess["thread_id"]}}
 
     # pull the latest user message from the UI history ( send to graph if needed )
